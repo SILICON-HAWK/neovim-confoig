@@ -1,60 +1,100 @@
 return {
   "nvim-treesitter/nvim-treesitter",
-  branch = "master",
+  branch = "main",
+  lazy = false,
   build = ":TSUpdate",
 
   dependencies = {
     {
       "nvim-treesitter/nvim-treesitter-textobjects",
-      branch = "master",
+      branch = "main",
     },
   },
 
   config = function()
-    require("nvim-treesitter.configs").setup({
-      ensure_installed = {
-        "c",
-        "lua",
-        "vim",
-        "vimdoc",
-        "query",
-        "javascript",
-        "typescript",
-        "html",
-        "css",
-      },
+    local ts = require("nvim-treesitter")
 
-      highlight = {
-        enable = true,
-      },
+    ts.setup({
+      install_dir = vim.fn.stdpath("data") .. "/site",
+    })
 
-      indent = {
-        enable = true,
-      },
+    -- Ensure parsers are installed
+    local parsers = {
+      "c",
+      "lua",
+      "vim",
+      "vimdoc",
+      "query",
+      "javascript",
+      "typescript",
+      "html",
+      "css",
+      "markdown",
+      "markdown_inline",
+    }
+    ts.install(parsers)
 
-      textobjects = {
-        select = {
-          lookahead = true,
+    -- Enable Treesitter highlighting and indent natively for all filetypes with installed parsers
+    vim.api.nvim_create_autocmd("FileType", {
+      callback = function(args)
+        pcall(vim.treesitter.start, args.buf)
+        vim.bo[args.buf].indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
+      end,
+    })
 
-          keymaps = {
-            ["af"] = "@function.outer",
-            ["if"] = "@function.inner",
-
-            ["ac"] = "@class.outer",
-            ["ic"] = "@class.inner",
-
-            ["al"] = "@loop.outer",
-            ["il"] = "@loop.inner",
-
-            ["aa"] = "@parameter.outer",
-            ["ia"] = "@parameter.inner",
-          },
-        },
+    -- Setup nvim-treesitter-textobjects
+    require("nvim-treesitter-textobjects").setup({
+      select = {
+        lookahead = true,
       },
     })
 
-    local shared = require("nvim-treesitter.textobjects.shared")
-    local ts_utils = require("nvim-treesitter.ts_utils")
+    local select = require("nvim-treesitter-textobjects.select")
+    local textobject_keymaps = {
+      ["af"] = "@function.outer",
+      ["if"] = "@function.inner",
+      ["ac"] = "@class.outer",
+      ["ic"] = "@class.inner",
+      ["al"] = "@loop.outer",
+      ["il"] = "@loop.inner",
+      ["aa"] = "@parameter.outer",
+      ["ia"] = "@parameter.inner",
+    }
+    for key, query in pairs(textobject_keymaps) do
+      vim.keymap.set({ "x", "o" }, key, function()
+        select.select_textobject(query, "textobjects")
+      end)
+    end
+
+    -- Smart hierarchical block selection: 'ab' (around block) and 'ib' (inside block)
+    local shared = require("nvim-treesitter-textobjects.shared")
+    local ts_range = vim.treesitter._range or require("nvim-treesitter-textobjects._range")
+
+    local function update_selection(range, selection_mode)
+      local start_row, start_col, end_row, end_col = ts_range.unpack4(range)
+      selection_mode = selection_mode or "v"
+
+      local mode = vim.api.nvim_get_mode()
+      if mode.mode ~= selection_mode then
+        selection_mode = vim.api.nvim_replace_termcodes(selection_mode, true, true, true)
+        vim.cmd.normal({ selection_mode, bang = true })
+      end
+
+      if end_col == 0 then
+        end_row = end_row - 1
+        end_col = #vim.api.nvim_buf_get_lines(0, end_row, end_row + 1, true)[1] + 1
+      end
+
+      local end_col_offset = 1
+      if selection_mode == "v" and vim.o.selection == "exclusive" then
+        end_col_offset = 0
+      end
+      end_col = end_col - end_col_offset
+
+      vim.api.nvim_win_set_cursor(0, { start_row + 1, start_col })
+      vim.cmd("normal! o")
+      vim.api.nvim_win_set_cursor(0, { end_row + 1, end_col })
+    end
 
     local chain = nil
 
@@ -62,22 +102,26 @@ return {
       local out = {}
       local seen = {}
       for _, cap in ipairs(captures) do
-        local _, range, node = shared.textobject_at_point(cap, "textobjects", nil, nil, {})
-        if node and range then
-          local key = table.concat(range, ",")
+        local range = shared.textobject_at_point(cap, "textobjects", nil, nil, {})
+        if range then
+          local srow, scol, erow, ecol = ts_range.unpack4(range)
+          local key = string.format("%d,%d,%d,%d", srow, scol, erow, ecol)
           if not seen[key] then
             seen[key] = true
-            out[#out + 1] = { range = range, node = node, cap = cap }
+            out[#out + 1] = {
+              range = range,
+              line_span = erow - srow,
+              col_span = ecol - scol,
+              cap = cap,
+            }
           end
         end
       end
       table.sort(out, function(a, b)
-        local ar = a.range[3] - a.range[1]
-        local br = b.range[3] - b.range[1]
-        if ar ~= br then
-          return ar < br
+        if a.line_span ~= b.line_span then
+          return a.line_span < b.line_span
         end
-        return (a.range[4] - a.range[2]) < (b.range[4] - b.range[2])
+        return a.col_span < b.col_span
       end)
       return out
     end
@@ -104,13 +148,13 @@ return {
         if chain.idx < #chain.list then
           chain.idx = chain.idx + 1
         end
-        ts_utils.update_selection(0, chain.list[chain.idx].node, "v")
+        update_selection(chain.list[chain.idx].range, "v")
         chain.last = { selection_pos() }
         return
       end
 
       chain = { buf = buf, list = candidates, idx = 1 }
-      ts_utils.update_selection(0, chain.list[1].node, "v")
+      update_selection(chain.list[1].range, "v")
       chain.last = { selection_pos() }
     end
 
